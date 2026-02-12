@@ -1,0 +1,88 @@
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      - ACCEPT_EULA=Y
+      - MSSQL_SA_PASSWORD=Your_password123
+    ports:
+      - "1433:1433"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P Your_password123 -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  seq:
+    image: datalust/seq:latest
+    environment:
+      - ACCEPT_EULA=Y
+    ports:
+      - "5341:80"
+
+  identity-api:
+    build:
+      context: ..
+      dockerfile: src/Identity/Identity.Api/Dockerfile
+    environment:
+      - ASPNETCORE_URLS=http://+:8080
+      - ConnectionStrings__IdentityDb=Server=mssql,1433;Database=IdentityDb;User Id=sa;Password=Your_password123;TrustServerCertificate=True
+      - SEQ_URL=http://seq:80
+      - Jwt__Issuer=identity
+      - Jwt__Audience=gateway
+    depends_on:
+      mssql:
+        condition: service_healthy
+    ports:
+      - "7001:8080"
+
+  orders-api:
+    build:
+      context: ..
+      dockerfile: src/Services.Orders/Orders.Api/Dockerfile
+    environment:
+      - ASPNETCORE_URLS=http://+:8080
+      - SEQ_URL=http://seq:80
+      - Jwt__Issuer=identity
+      - Jwt__Audience=gateway
+      - Identity__JwksUrl=http://identity-api:8080/.well-known/jwks.json
+    ports:
+      - "7002:8080"
+    depends_on:
+      - identity-api
+
+  payments-api:
+    build:
+      context: ..
+      dockerfile: src/Services.Payments/Payments.Api/Dockerfile
+    environment:
+      - ASPNETCORE_URLS=http://+:8080
+      - SEQ_URL=http://seq:80
+      - Jwt__Issuer=identity
+      - Jwt__Audience=gateway
+      - Identity__JwksUrl=http://identity-api:8080/.well-known/jwks.json
+    ports:
+      - "7003:8080"
+    depends_on:
+      - identity-api
+
+  gateway-api:
+    build:
+      context: ..
+      dockerfile: src/Gateway/Gateway.Api/Dockerfile
+    environment:
+      - ASPNETCORE_URLS=http://+:8080
+      - SEQ_URL=http://seq:80
+      - Jwt__Issuer=identity
+      - Jwt__Audience=gateway
+      - Identity__JwksUrl=http://identity-api:8080/.well-known/jwks.json
+    ports:
+      - "7000:8080"
+    depends_on:
+      - orders-api
+      - payments-api
+      - identity-api
