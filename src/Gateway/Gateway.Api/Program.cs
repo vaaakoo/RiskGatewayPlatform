@@ -2,13 +2,11 @@ using BuildingBlocks.Errors;
 using BuildingBlocks.Http;
 using BuildingBlocks.Logging;
 using BuildingBlocks.Observability;
+using Gateway.Api.Extensions;
 using Gateway.Api.Security;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
-using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.IdentityModel.Tokens;
 using System.Security.Claims;
-using System.Threading.RateLimiting;
 using Yarp.ReverseProxy.Transforms;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -17,30 +15,7 @@ builder.AddSerilogLogging("Gateway");
 builder.Services.AddProblemDetails();
 builder.Services.AddObservability(builder.Configuration, "Gateway");
 
-builder.Services.AddMemoryCache();
-builder.Services.AddHttpClient<JwksProvider>();
-
-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(o =>
-    {
-        o.RequireHttpsMetadata = false; // docker/dev
-        o.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidateIssuer = true,
-            ValidIssuer = builder.Configuration["Jwt:Issuer"] ?? "identity",
-            ValidateAudience = true,
-            ValidAudience = builder.Configuration["Jwt:Audience"] ?? "gateway",
-            ValidateLifetime = true,
-            ValidateIssuerSigningKey = true,
-            IssuerSigningKeyResolver = (token, secToken, kid, parms) =>
-            {
-                // sync-over-async kept minimal; production: preload keys / background refresh
-                var sp = builder.Services.BuildServiceProvider();
-                var prov = sp.GetRequiredService<JwksProvider>();
-                return prov.GetSigningKeysAsync(CancellationToken.None).GetAwaiter().GetResult();
-            }
-        };
-    });
+builder.Services.AddGatewayJwtAuth(builder.Configuration);
 
 builder.Services.AddAuthorization(o =>
 {
@@ -50,29 +25,12 @@ builder.Services.AddAuthorization(o =>
     o.AddPolicy("scope:payments.write", p => p.RequireAssertion(ctx => HasScope(ctx, "payments.write")));
 });
 
-builder.Services.AddRateLimiter(options =>
-{
-    options.RejectionStatusCode = 429;
-
-    options.AddPolicy("per-client", httpContext =>
-    {
-        var clientId = httpContext.User.FindFirstValue("client_id") ?? "anonymous";
-        return RateLimitPartition.GetFixedWindowLimiter(
-            partitionKey: clientId,
-            factory: _ => new FixedWindowRateLimiterOptions
-            {
-                PermitLimit = 50,
-                Window = TimeSpan.FromSeconds(10),
-                QueueLimit = 0
-            });
-    });
-});
+builder.Services.AddGatewayRateLimiting();
 
 builder.Services.AddReverseProxy()
     .LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"))
     .AddTransforms(t =>
     {
-        // forward correlation id
         t.AddRequestTransform(ctx =>
         {
             if (ctx.HttpContext.Request.Headers.TryGetValue(CorrelationIdMiddleware.HeaderName, out var v))
@@ -80,11 +38,17 @@ builder.Services.AddReverseProxy()
 
             return ValueTask.CompletedTask;
         });
-
-        // mask auth header in logs -> done via Serilog config usually; here we just avoid copying it anywhere
     });
 
 var app = builder.Build();
+
+// Warmup JWKS cache to reduce first-request latency
+try
+{
+    var jwksProv = app.Services.GetRequiredService<JwksProvider>();
+    _ = await jwksProv.GetSigningKeysAsync(CancellationToken.None);
+}
+catch { /* OK if Identity not yet ready during startup */ }
 
 app.UseCentralExceptionHandling();
 app.UseCorrelationId();
@@ -92,12 +56,11 @@ app.UseCorrelationId();
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 app.MapGet("/ready", () => Results.Ok(new { ready = true }));
 
-app.UseRateLimiter();
-
 app.UseAuthentication();
 app.UseAuthorization();
 
-// YARP routes will specify AuthorizationPolicy per route (see appsettings.json)
+app.UseRateLimiter();
+
 app.MapReverseProxy();
 
 app.Run();

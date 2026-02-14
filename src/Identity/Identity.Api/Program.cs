@@ -2,6 +2,7 @@ using BuildingBlocks.Errors;
 using BuildingBlocks.Http;
 using BuildingBlocks.Logging;
 using BuildingBlocks.Observability;
+using Identity.Api.Extensions;
 using Identity.Api.Security;
 using Identity.Application.Security;
 using Identity.Application.Tokens;
@@ -20,14 +21,11 @@ builder.Services.AddObservability(builder.Configuration, "Identity");
 builder.Services.Configure<JwtOptions>(builder.Configuration.GetSection("Jwt"));
 builder.Services.AddSingleton<RsaKeyProvider>();
 
-builder.Services.AddDbContext<IdentityDbContext>(opt =>
-{
-    opt.UseSqlServer(builder.Configuration.GetConnectionString("IdentityDb"));
-});
+builder.Services.AddIdentityPersistence(builder.Configuration, builder.Environment);
 
 builder.Services.AddScoped(sp =>
 {
-    var opts = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<JwtOptions>>().Value;
+    var opts = sp.GetRequiredService<IOptions<JwtOptions>>().Value;
     var rsa = sp.GetRequiredService<RsaKeyProvider>().Rsa;
     return new JwtService(opts, rsa);
 });
@@ -35,6 +33,8 @@ builder.Services.AddScoped(sp =>
 builder.Services.AddScoped<RefreshTokenService>();
 
 var app = builder.Build();
+
+await app.UseIdentityMigrationsAndSeeding();
 
 app.UseCentralExceptionHandling();
 app.UseCorrelationId();
@@ -117,7 +117,7 @@ app.MapPost("/connect/token", async (
     }
 
     return Results.Problem("unsupported_grant_type", statusCode: 400);
-});
+}).DisableAntiforgery();
 
 app.MapPost("/connect/revoke", async (
     IdentityDbContext db,
@@ -135,7 +135,7 @@ app.MapPost("/connect/revoke", async (
 
     await refreshSvc.RevokeAsync(client_id, token);
     return Results.Ok(new { revoked = true });
-});
+}).DisableAntiforgery();
 
 app.Run();
 

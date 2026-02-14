@@ -10,8 +10,8 @@ public sealed class JwksProvider(HttpClient http, IMemoryCache cache, IConfigura
 
     public async Task<IEnumerable<SecurityKey>> GetSigningKeysAsync(CancellationToken ct)
     {
-        if (cache.TryGetValue(CacheKey, out IEnumerable<SecurityKey> keys))
-            return keys!;
+        if (cache.TryGetValue(CacheKey, out IEnumerable<SecurityKey>? keys) && keys is not null)
+            return keys;
 
         var jwksUrl = cfg["Identity:JwksUrl"] ?? throw new InvalidOperationException("Identity:JwksUrl missing");
         var jwks = await http.GetFromJsonAsync<JsonWebKeySet>(jwksUrl, cancellationToken: ct)
@@ -21,4 +21,6 @@ public sealed class JwksProvider(HttpClient http, IMemoryCache cache, IConfigura
         cache.Set(CacheKey, keys, TimeSpan.FromMinutes(5));
         return keys;
     }
+
+    public void InvalidateCache() => cache.Remove(CacheKey);
 }

@@ -5,15 +5,36 @@ namespace Identity.Api.Security;
 
 public sealed class RsaKeyProvider
 {
-    // Production: load RSA from Key Vault / mounted volume PEM.
     private readonly RSA _rsa;
     public string KeyId { get; }
 
-    public RsaKeyProvider(IConfiguration cfg)
+    public RsaKeyProvider(IConfiguration cfg, IWebHostEnvironment env)
     {
-        // Minimal demo: deterministic KID per startup
         _rsa = RSA.Create(2048);
-        KeyId = cfg["JWT_KID"] ?? Guid.NewGuid().ToString("N");
+
+        if (env.IsEnvironment("Testing"))
+        {
+            // In-memory key for tests; no file I/O
+            KeyId = cfg["JWT_KID"] ?? "test-kid";
+        }
+        else
+        {
+            var keysPath = cfg["KEYS_PATH"] ?? Path.Combine(AppContext.BaseDirectory, "keys");
+            Directory.CreateDirectory(keysPath);
+            var pemPath = Path.Combine(keysPath, "private_key.pem");
+
+            if (File.Exists(pemPath))
+            {
+                var pem = File.ReadAllText(pemPath);
+                _rsa.ImportFromPem(pem);
+            }
+            else
+            {
+                File.WriteAllText(pemPath, _rsa.ExportPkcs8PrivateKeyPem());
+            }
+
+            KeyId = cfg["JWT_KID"] ?? DeriveKid(_rsa);
+        }
     }
 
     public RSA Rsa => _rsa;
@@ -29,5 +50,12 @@ public sealed class RsaKeyProvider
         {
             Keys = { jwk }
         };
+    }
+
+    private static string DeriveKid(RSA rsa)
+    {
+        var pub = rsa.ExportSubjectPublicKeyInfo();
+        var hash = SHA256.HashData(pub);
+        return Convert.ToHexStringLower(hash)[..16];
     }
 }

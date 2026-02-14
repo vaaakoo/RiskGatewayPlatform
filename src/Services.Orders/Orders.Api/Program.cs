@@ -14,7 +14,9 @@ builder.AddSerilogLogging("Orders");
 builder.Services.AddProblemDetails();
 builder.Services.AddObservability(builder.Configuration, "Orders");
 
+builder.Services.AddHttpContextAccessor();
 builder.Services.AddMemoryCache();
+builder.Services.AddSingleton<OrdersJwksProvider>();
 builder.Services.AddHttpClient<OrdersJwksProvider>();
 
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
@@ -29,11 +31,25 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidAudience = builder.Configuration["Jwt:Audience"] ?? "gateway",
             ValidateLifetime = true,
             ValidateIssuerSigningKey = true,
-            IssuerSigningKeyResolver = (token, secToken, kid, parms) =>
+        };
+
+        o.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = async ctx =>
             {
-                var sp = builder.Services.BuildServiceProvider();
-                var prov = sp.GetRequiredService<OrdersJwksProvider>();
-                return prov.GetSigningKeysAsync(CancellationToken.None).GetAwaiter().GetResult();
+                var provider = ctx.HttpContext.RequestServices.GetRequiredService<OrdersJwksProvider>();
+                var keys = await provider.GetSigningKeysAsync(ctx.HttpContext.RequestAborted);
+                ctx.Options.TokenValidationParameters.IssuerSigningKeys = keys;
+            },
+            OnAuthenticationFailed = async ctx =>
+            {
+                if (ctx.Exception is SecurityTokenSignatureKeyNotFoundException)
+                {
+                    var provider = ctx.HttpContext.RequestServices.GetRequiredService<OrdersJwksProvider>();
+                    provider.InvalidateCache();
+                    var keys = await provider.GetSigningKeysAsync(ctx.HttpContext.RequestAborted);
+                    ctx.Options.TokenValidationParameters.IssuerSigningKeys = keys;
+                }
             }
         };
     });
@@ -45,6 +61,13 @@ builder.Services.AddAuthorization(o =>
 });
 
 var app = builder.Build();
+
+try
+{
+    var jwksProv = app.Services.GetRequiredService<OrdersJwksProvider>();
+    _ = await jwksProv.GetSigningKeysAsync(CancellationToken.None);
+}
+catch { }
 
 app.UseCentralExceptionHandling();
 app.UseCorrelationId();
@@ -75,8 +98,8 @@ sealed class OrdersJwksProvider(HttpClient http, Microsoft.Extensions.Caching.Me
     private const string CacheKey = "jwks_keys";
     public async Task<IEnumerable<SecurityKey>> GetSigningKeysAsync(CancellationToken ct)
     {
-        if (cache.TryGetValue(CacheKey, out IEnumerable<SecurityKey> keys))
-            return keys!;
+        if (cache.TryGetValue(CacheKey, out IEnumerable<SecurityKey>? keys) && keys is not null)
+            return keys;
 
         var jwksUrl = cfg["Identity:JwksUrl"] ?? throw new InvalidOperationException("Identity:JwksUrl missing");
         var jwks = await http.GetFromJsonAsync<JsonWebKeySet>(jwksUrl, cancellationToken: ct)
@@ -86,4 +109,6 @@ sealed class OrdersJwksProvider(HttpClient http, Microsoft.Extensions.Caching.Me
         cache.Set(CacheKey, keys, TimeSpan.FromMinutes(5));
         return keys;
     }
+
+    public void InvalidateCache() => cache.Remove(CacheKey);
 }
