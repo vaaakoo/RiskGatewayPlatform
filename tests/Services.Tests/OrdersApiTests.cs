@@ -8,8 +8,11 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
 using System.Net;
+using System.Net.Http.Json;
 using System.Security.Claims;
 using System.Security.Cryptography;
+using System.Text.Json;
+using Shared.Contracts.Orders;
 
 using OrdersProgram = OrdersAlias::Program;
 
@@ -17,6 +20,11 @@ namespace Services.Tests;
 
 public class OrdersApiTests : IClassFixture<OrdersApiTests.OrdersTestFixture>
 {
+    private static readonly JsonSerializerOptions JsonOpts = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    };
+
     private readonly HttpClient _client;
     private readonly RSA _rsa;
 
@@ -64,6 +72,7 @@ public class OrdersApiTests : IClassFixture<OrdersApiTests.OrdersTestFixture>
         var req = new HttpRequestMessage(HttpMethod.Post, "/orders");
         req.Headers.Authorization =
             new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+        req.Content = JsonContent.Create(new CreateOrderRequest("demo-order", 10.5m, "USD"), mediaType: null, options: JsonOpts);
 
         var res = await _client.SendAsync(req);
         res.StatusCode.Should().Be(HttpStatusCode.Created);

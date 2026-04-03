@@ -2,10 +2,16 @@ using BuildingBlocks.Errors;
 using BuildingBlocks.Http;
 using BuildingBlocks.Logging;
 using BuildingBlocks.Observability;
+using BuildingBlocks.Security;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
-using Microsoft.Extensions.Caching.Memory;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.IdentityModel.Tokens;
+using Orders.Api.Extensions;
+using Orders.Application.Orders;
+using Orders.Infrastructure;
+using Orders.Infrastructure.Persistence;
+using Shared.Contracts.Orders;
 using System.Security.Claims;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -14,10 +20,12 @@ builder.AddSerilogLogging("Orders");
 builder.Services.AddProblemDetails();
 builder.Services.AddObservability(builder.Configuration, "Orders");
 
+builder.Services.AddOrdersPersistence(builder.Configuration, builder.Environment);
+builder.Services.AddScoped<OrderService>();
+
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddMemoryCache();
-builder.Services.AddSingleton<OrdersJwksProvider>();
-builder.Services.AddHttpClient<OrdersJwksProvider>();
+builder.Services.AddHttpClient<IdentityJwksProvider>();
 
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(o =>
@@ -37,7 +45,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         {
             OnMessageReceived = async ctx =>
             {
-                var provider = ctx.HttpContext.RequestServices.GetRequiredService<OrdersJwksProvider>();
+                var provider = ctx.HttpContext.RequestServices.GetRequiredService<IdentityJwksProvider>();
                 var keys = await provider.GetSigningKeysAsync(ctx.HttpContext.RequestAborted);
                 ctx.Options.TokenValidationParameters.IssuerSigningKeys = keys;
             },
@@ -45,7 +53,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             {
                 if (ctx.Exception is SecurityTokenSignatureKeyNotFoundException)
                 {
-                    var provider = ctx.HttpContext.RequestServices.GetRequiredService<OrdersJwksProvider>();
+                    var provider = ctx.HttpContext.RequestServices.GetRequiredService<IdentityJwksProvider>();
                     provider.InvalidateCache();
                     var keys = await provider.GetSigningKeysAsync(ctx.HttpContext.RequestAborted);
                     ctx.Options.TokenValidationParameters.IssuerSigningKeys = keys;
@@ -62,12 +70,14 @@ builder.Services.AddAuthorization(o =>
 
 var app = builder.Build();
 
+await app.UseOrdersDatabaseAsync();
+
 try
 {
-    var jwksProv = app.Services.GetRequiredService<OrdersJwksProvider>();
+    var jwksProv = app.Services.GetRequiredService<IdentityJwksProvider>();
     _ = await jwksProv.GetSigningKeysAsync(CancellationToken.None);
 }
-catch { }
+catch { /* Identity may be unavailable during startup */ }
 
 app.UseCentralExceptionHandling();
 app.UseCorrelationId();
@@ -76,12 +86,39 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+app.MapGet("/ready", async (OrdersDbContext db) =>
+{
+    var ok = await db.Database.CanConnectAsync();
+    return ok ? Results.Ok(new { ready = true }) : Results.Problem("DB not ready", statusCode: 503);
+});
 
-app.MapGet("/orders", () => Results.Ok(new[] { new { id = 1, item = "demo" } }))
-   .RequireAuthorization("orders.read");
+app.MapGet("/orders", async (OrderService svc, ClaimsPrincipal user, CancellationToken ct) =>
+{
+    var clientId = ClientId(user);
+    var list = await svc.ListAsync(clientId, ct);
+    return Results.Ok(list);
+}).RequireAuthorization("orders.read");
 
-app.MapPost("/orders", () => Results.Created("/orders/1", new { id = 1 }))
-   .RequireAuthorization("orders.write");
+app.MapGet("/orders/{id:guid}", async (Guid id, OrderService svc, ClaimsPrincipal user, CancellationToken ct) =>
+{
+    var clientId = ClientId(user);
+    var o = await svc.GetAsync(id, clientId, ct);
+    return o is null ? Results.NotFound() : Results.Ok(o);
+}).RequireAuthorization("orders.read");
+
+app.MapPost("/orders", async (OrderService svc, ClaimsPrincipal user, [FromBody] CreateOrderRequest body, CancellationToken ct) =>
+{
+    try
+    {
+        var clientId = ClientId(user);
+        var created = await svc.CreateAsync(body, clientId, ct);
+        return Results.Created($"/orders/{created.Id}", created);
+    }
+    catch (ArgumentException ex)
+    {
+        return Results.Problem(ex.Message, statusCode: 400);
+    }
+}).RequireAuthorization("orders.write");
 
 app.Run();
 
@@ -91,24 +128,8 @@ static bool HasScope(AuthorizationHandlerContext ctx, string required)
     return scope.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Contains(required);
 }
 
+static string ClientId(ClaimsPrincipal user) =>
+    user.FindFirstValue("client_id") ?? user.FindFirstValue("sub")
+    ?? throw new InvalidOperationException("Missing client identity claim.");
+
 public partial class Program { }
-
-sealed class OrdersJwksProvider(HttpClient http, Microsoft.Extensions.Caching.Memory.IMemoryCache cache, IConfiguration cfg)
-{
-    private const string CacheKey = "jwks_keys";
-    public async Task<IEnumerable<SecurityKey>> GetSigningKeysAsync(CancellationToken ct)
-    {
-        if (cache.TryGetValue(CacheKey, out IEnumerable<SecurityKey>? keys) && keys is not null)
-            return keys;
-
-        var jwksUrl = cfg["Identity:JwksUrl"] ?? throw new InvalidOperationException("Identity:JwksUrl missing");
-        var jwks = await http.GetFromJsonAsync<JsonWebKeySet>(jwksUrl, cancellationToken: ct)
-                   ?? throw new InvalidOperationException("Failed to load JWKS");
-
-        keys = jwks.Keys.Select(k => (SecurityKey)k).ToArray();
-        cache.Set(CacheKey, keys, TimeSpan.FromMinutes(5));
-        return keys;
-    }
-
-    public void InvalidateCache() => cache.Remove(CacheKey);
-}

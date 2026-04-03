@@ -1,4 +1,4 @@
-using Gateway.Api.Security;
+using BuildingBlocks.Security;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 
@@ -12,8 +12,7 @@ public static class GatewayAuthExtensions
     {
         services.AddHttpContextAccessor();
         services.AddMemoryCache();
-        services.AddSingleton<JwksProvider>();
-        services.AddHttpClient<JwksProvider>();
+        services.AddHttpClient<IdentityJwksProvider>();
 
         services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             .AddJwtBearer(o =>
@@ -33,7 +32,7 @@ public static class GatewayAuthExtensions
                 {
                     OnMessageReceived = async ctx =>
                     {
-                        var provider = ctx.HttpContext.RequestServices.GetRequiredService<JwksProvider>();
+                        var provider = ctx.HttpContext.RequestServices.GetRequiredService<IdentityJwksProvider>();
                         var keys = await provider.GetSigningKeysAsync(ctx.HttpContext.RequestAborted);
                         ctx.Options.TokenValidationParameters.IssuerSigningKeys = keys;
                     },
@@ -41,7 +40,7 @@ public static class GatewayAuthExtensions
                     {
                         if (ctx.Exception is SecurityTokenSignatureKeyNotFoundException)
                         {
-                            var provider = ctx.HttpContext.RequestServices.GetRequiredService<JwksProvider>();
+                            var provider = ctx.HttpContext.RequestServices.GetRequiredService<IdentityJwksProvider>();
                             provider.InvalidateCache();
                             var keys = await provider.GetSigningKeysAsync(ctx.HttpContext.RequestAborted);
                             ctx.Options.TokenValidationParameters.IssuerSigningKeys = keys;

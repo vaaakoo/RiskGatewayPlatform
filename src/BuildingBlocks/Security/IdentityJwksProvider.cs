@@ -1,12 +1,14 @@
-﻿using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Configuration;
 using Microsoft.IdentityModel.Tokens;
 using System.Net.Http.Json;
 
-namespace Gateway.Api.Security;
+namespace BuildingBlocks.Security;
 
-public sealed class JwksProvider(HttpClient http, IMemoryCache cache, IConfiguration cfg)
+/// <summary>Fetches and caches signing keys from Identity's JWKS document.</summary>
+public sealed class IdentityJwksProvider(HttpClient http, IMemoryCache cache, IConfiguration cfg)
 {
-    private const string CacheKey = "jwks_keys";
+    private const string CacheKey = "identity_jwks_signing_keys";
 
     public async Task<IEnumerable<SecurityKey>> GetSigningKeysAsync(CancellationToken ct)
     {

@@ -2,10 +2,18 @@ using BuildingBlocks.Errors;
 using BuildingBlocks.Http;
 using BuildingBlocks.Logging;
 using BuildingBlocks.Observability;
+using BuildingBlocks.Security;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
-using Microsoft.Extensions.Caching.Memory;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.IdentityModel.Tokens;
+using Payments.Api.Extensions;
+using Payments.Api.Testing;
+using Payments.Application.Abstractions;
+using Payments.Application.Payments;
+using Payments.Infrastructure;
+using Payments.Infrastructure.Persistence;
+using Shared.Contracts.Payments;
 using System.Security.Claims;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -14,10 +22,17 @@ builder.AddSerilogLogging("Payments");
 builder.Services.AddProblemDetails();
 builder.Services.AddObservability(builder.Configuration, "Payments");
 
+builder.Services.AddPaymentsPersistence(builder.Configuration, builder.Environment);
+builder.Services.AddScoped<PaymentService>();
+
+if (builder.Environment.IsEnvironment("Testing"))
+    builder.Services.AddSingleton<IOrdersReadClient, StubOrdersReadClient>();
+else
+    builder.Services.AddOrdersReadIntegration(builder.Configuration);
+
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddMemoryCache();
-builder.Services.AddSingleton<PaymentsJwksProvider>();
-builder.Services.AddHttpClient<PaymentsJwksProvider>();
+builder.Services.AddHttpClient<IdentityJwksProvider>();
 
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(o =>
@@ -37,7 +52,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         {
             OnMessageReceived = async ctx =>
             {
-                var provider = ctx.HttpContext.RequestServices.GetRequiredService<PaymentsJwksProvider>();
+                var provider = ctx.HttpContext.RequestServices.GetRequiredService<IdentityJwksProvider>();
                 var keys = await provider.GetSigningKeysAsync(ctx.HttpContext.RequestAborted);
                 ctx.Options.TokenValidationParameters.IssuerSigningKeys = keys;
             },
@@ -45,7 +60,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             {
                 if (ctx.Exception is SecurityTokenSignatureKeyNotFoundException)
                 {
-                    var provider = ctx.HttpContext.RequestServices.GetRequiredService<PaymentsJwksProvider>();
+                    var provider = ctx.HttpContext.RequestServices.GetRequiredService<IdentityJwksProvider>();
                     provider.InvalidateCache();
                     var keys = await provider.GetSigningKeysAsync(ctx.HttpContext.RequestAborted);
                     ctx.Options.TokenValidationParameters.IssuerSigningKeys = keys;
@@ -62,9 +77,11 @@ builder.Services.AddAuthorization(o =>
 
 var app = builder.Build();
 
+await app.UsePaymentsDatabaseAsync();
+
 try
 {
-    var jwksProv = app.Services.GetRequiredService<PaymentsJwksProvider>();
+    var jwksProv = app.Services.GetRequiredService<IdentityJwksProvider>();
     _ = await jwksProv.GetSigningKeysAsync(CancellationToken.None);
 }
 catch { }
@@ -76,12 +93,43 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+app.MapGet("/ready", async (PaymentsDbContext db) =>
+{
+    var ok = await db.Database.CanConnectAsync();
+    return ok ? Results.Ok(new { ready = true }) : Results.Problem("DB not ready", statusCode: 503);
+});
 
-app.MapGet("/payments", () => Results.Ok(new[] { new { id = 1, amount = 100.0m } }))
-   .RequireAuthorization("payments.read");
+app.MapGet("/payments", async (PaymentService svc, ClaimsPrincipal user, CancellationToken ct) =>
+{
+    var clientId = ClientId(user);
+    var list = await svc.ListAsync(clientId, ct);
+    return Results.Ok(list);
+}).RequireAuthorization("payments.read");
 
-app.MapPost("/payments", () => Results.Created("/payments/1", new { id = 1 }))
-   .RequireAuthorization("payments.write");
+app.MapGet("/payments/{id:guid}", async (Guid id, PaymentService svc, ClaimsPrincipal user, CancellationToken ct) =>
+{
+    var clientId = ClientId(user);
+    var p = await svc.GetAsync(id, clientId, ct);
+    return p is null ? Results.NotFound() : Results.Ok(p);
+}).RequireAuthorization("payments.read");
+
+app.MapPost("/payments", async (PaymentService svc, ClaimsPrincipal user, [FromBody] CreatePaymentRequest body, CancellationToken ct) =>
+{
+    try
+    {
+        var clientId = ClientId(user);
+        var created = await svc.CreateAsync(body, clientId, ct);
+        return Results.Created($"/payments/{created.Id}", created);
+    }
+    catch (ArgumentException ex)
+    {
+        return Results.Problem(ex.Message, statusCode: 400);
+    }
+    catch (InvalidOperationException ex)
+    {
+        return Results.Problem(ex.Message, statusCode: 400);
+    }
+}).RequireAuthorization("payments.write");
 
 app.Run();
 
@@ -91,24 +139,8 @@ static bool HasScope(AuthorizationHandlerContext ctx, string required)
     return scope.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Contains(required);
 }
 
+static string ClientId(ClaimsPrincipal user) =>
+    user.FindFirstValue("client_id") ?? user.FindFirstValue("sub")
+    ?? throw new InvalidOperationException("Missing client identity claim.");
+
 public partial class Program { }
-
-sealed class PaymentsJwksProvider(HttpClient http, IMemoryCache cache, IConfiguration cfg)
-{
-    private const string CacheKey = "jwks_keys";
-    public async Task<IEnumerable<SecurityKey>> GetSigningKeysAsync(CancellationToken ct)
-    {
-        if (cache.TryGetValue(CacheKey, out IEnumerable<SecurityKey>? keys) && keys is not null)
-            return keys;
-
-        var jwksUrl = cfg["Identity:JwksUrl"] ?? throw new InvalidOperationException("Identity:JwksUrl missing");
-        var jwks = await http.GetFromJsonAsync<JsonWebKeySet>(jwksUrl, cancellationToken: ct)
-                   ?? throw new InvalidOperationException("Failed to load JWKS");
-
-        keys = jwks.Keys.Select(k => (SecurityKey)k).ToArray();
-        cache.Set(CacheKey, keys, TimeSpan.FromMinutes(5));
-        return keys;
-    }
-
-    public void InvalidateCache() => cache.Remove(CacheKey);
-}

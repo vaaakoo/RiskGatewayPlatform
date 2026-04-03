@@ -8,8 +8,11 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
 using System.Net;
+using System.Net.Http.Json;
 using System.Security.Claims;
 using System.Security.Cryptography;
+using System.Text.Json;
+using Shared.Contracts.Payments;
 
 using PaymentsProgram = PaymentsAlias::Program;
 
@@ -17,6 +20,11 @@ namespace Services.Tests;
 
 public class PaymentsApiTests : IClassFixture<PaymentsApiTests.PaymentsTestFixture>
 {
+    private static readonly JsonSerializerOptions JsonOpts = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    };
+
     private readonly HttpClient _client;
     private readonly RSA _rsa;
 
@@ -55,6 +63,19 @@ public class PaymentsApiTests : IClassFixture<PaymentsApiTests.PaymentsTestFixtu
 
         var res = await _client.SendAsync(req);
         res.StatusCode.Should().Be(HttpStatusCode.OK);
+    }
+
+    [Fact]
+    public async Task Post_with_write_scope_returns_201()
+    {
+        var token = CreateToken("test-client", "payments.write");
+        var req = new HttpRequestMessage(HttpMethod.Post, "/payments");
+        req.Headers.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+        req.Content = JsonContent.Create(new CreatePaymentRequest(Guid.NewGuid(), 100m, "USD"), mediaType: null, options: JsonOpts);
+
+        var res = await _client.SendAsync(req);
+        res.StatusCode.Should().Be(HttpStatusCode.Created);
     }
 
     private string CreateToken(string clientId, string scope)

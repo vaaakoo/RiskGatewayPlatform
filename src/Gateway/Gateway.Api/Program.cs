@@ -2,8 +2,8 @@ using BuildingBlocks.Errors;
 using BuildingBlocks.Http;
 using BuildingBlocks.Logging;
 using BuildingBlocks.Observability;
+using BuildingBlocks.Security;
 using Gateway.Api.Extensions;
-using Gateway.Api.Security;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.IdentityModel.Tokens;
 using System.Security.Claims;
@@ -45,7 +45,7 @@ var app = builder.Build();
 // Warmup JWKS cache to reduce first-request latency
 try
 {
-    var jwksProv = app.Services.GetRequiredService<JwksProvider>();
+    var jwksProv = app.Services.GetRequiredService<IdentityJwksProvider>();
     _ = await jwksProv.GetSigningKeysAsync(CancellationToken.None);
 }
 catch { /* OK if Identity not yet ready during startup */ }
